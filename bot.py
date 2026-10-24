@@ -1444,6 +1444,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await remove_adult_sticker(update, context):
         return
     await maybe_translate(update, context)
+    if await handle_group_game_answer(update, context):
+        return
     await aura_for_message(update)
 
     # Only DM-started members may submit answers to an active group puzzle.
@@ -1638,6 +1640,73 @@ def _make_game_card(title: str, prompt: str):
     d.text((70, H-92), "Reply in group with your answer  •  First correct answer wins", font=_couple_font(21), fill=(190, 211, 240))
     out = io.BytesIO(); im.save(out, format="JPEG", quality=90); out.seek(0); out.name = "nexus_game_card.jpg"
     return out
+
+# Group quiz event: /gamejoin starts a 10-minute, 10-question session; /endgame closes it.
+ACTIVE_GROUP_GAMES = {}
+GAME_QUESTION_LIMIT = 10
+GAME_DURATION_SECONDS = 600
+GAME_PRIZE_COINS = 3000
+
+def make_group_game_question():
+    bank = []
+    for key in ("hidden", "scramble", "riddle", "emoji", "anagram", "trivia", "truefalse"):
+        bank.extend(PUZZLE_BANK.get(key, []))
+    prompt, answer = random.choice(bank)
+    return prompt, answer.casefold().strip()
+
+async def gamejoin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
+    if not chat or chat.type not in ("group", "supergroup") or not user or not msg:
+        await safe_reply(update, "Ye command group mein use karein: /gamejoin")
+        return
+    if chat.id in ACTIVE_GROUP_GAMES:
+        await safe_reply(update, "🎮 Game pehle se chal raha hai! Answers do; har sahi jawab ke baad next question aayega.")
+        return
+    prompt, answer = make_group_game_question()
+    ACTIVE_GROUP_GAMES[chat.id] = {"host": user.id, "started": time.time(), "round": 1,
+        "prompt": prompt, "answer": answer, "scores": {}, "participants": {user.id: (user.username, user.first_name)}}
+    await msg.reply_text(f"🎮 NEXUS QUIZ STARTED!\n10 minutes • 10 questions • 10 rounds\nFirst correct answer moves to the next question.\nFinal winner gets 3000 coins (no Aura for each answer).\n\nQuestion 1/10: {prompt}\nJoin by answering below!")
+
+async def endgame_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat, msg = update.effective_chat, update.effective_message
+    if not chat or chat.type not in ("group", "supergroup") or not msg:
+        await safe_reply(update, " /endgame group mein use karein.")
+        return
+    game = ACTIVE_GROUP_GAMES.pop(chat.id, None)
+    if not game:
+        await msg.reply_text("Abhi koi active game nahi hai. Start karne ke liye /gamejoin")
+        return
+    scores = game["scores"]
+    if scores:
+        winner_id = max(scores, key=lambda uid: (scores[uid], -uid))
+        username, first_name = game["participants"].get(winner_id, (None, str(winner_id)))
+        row = adjust_score(chat.id, winner_id, username, first_name, total_delta=GAME_PRIZE_COINS, aura_delta=0)
+        display = "@" + username if username else (first_name or str(winner_id))
+        await msg.reply_text(f"🏆 GAME COMPLETE! Winner: {display}\nCorrect answers: {scores[winner_id]}\n🪙 Prize: +{GAME_PRIZE_COINS} coins\nTotal coins: {row['total_points']}\n✨ Aura unchanged by quiz answers.")
+    else:
+        await msg.reply_text("🛑 Game closed. Koi correct answer nahi mila, isliye prize award nahi hua.")
+
+async def handle_group_game_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not msg.text or not chat or not user or user.is_bot or chat.id not in ACTIVE_GROUP_GAMES:
+        return False
+    game = ACTIVE_GROUP_GAMES[chat.id]
+    if time.time() - game["started"] >= GAME_DURATION_SECONDS:
+        await endgame_cmd(update, context)
+        return True
+    if msg.text.strip().casefold() != game["answer"]:
+        return False
+    game["participants"][user.id] = (user.username, user.first_name)
+    game["scores"][user.id] = game["scores"].get(user.id, 0) + 1
+    if game["round"] >= GAME_QUESTION_LIMIT:
+        await msg.reply_text(f"✅ Correct! {user.first_name or 'Player'} wins the final question. All 10 questions complete; closing game and calculating winner...")
+        await endgame_cmd(update, context)
+        return True
+    game["round"] += 1
+    game["prompt"], game["answer"] = make_group_game_question()
+    await msg.reply_text(f"✅ Correct, {user.first_name or 'player'}! Next question {game['round']}/{GAME_QUESTION_LIMIT}: {game['prompt']}\n🏅 Your correct answers: {game['scores'][user.id]}")
+    return True
+
 
 async def start_puzzle(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str):
     if not await dm_game_gate(update, context):
@@ -2012,6 +2081,7 @@ def build_bot():
     bot_app.add_handler(CommandHandler("adminlist", adminlist_cmd))
     bot_app.add_handler(CommandHandler("report", report_cmd))
     bot_app.add_handler(CommandHandler("points", points_cmd))
+    bot_app.add_handler(CommandHandler("aurapoint", points_cmd))
     bot_app.add_handler(CommandHandler("top", top_cmd))
     bot_app.add_handler(CommandHandler("auratop", auratop_cmd))
     bot_app.add_handler(CommandHandler("worldtop", worldtop_cmd))
@@ -2064,6 +2134,8 @@ def build_bot():
     bot_app.add_handler(CommandHandler("emojiquiz", emojiquiz_cmd))
     bot_app.add_handler(CommandHandler("mathquiz", mathquiz_cmd))
     bot_app.add_handler(CommandHandler("puzzlehelp", puzzlehelp_cmd))
+    bot_app.add_handler(CommandHandler("gamejoin", gamejoin_cmd))
+    bot_app.add_handler(CommandHandler("endgame", endgame_cmd))
     bot_app.add_handler(ChatJoinRequestHandler(join_request))
     bot_app.add_handler(CallbackQueryHandler(join_request_action, pattern=r"^jr:(approve|decline):-?\d+:\d+$"))
     bot_app.add_handler(CallbackQueryHandler(start_buttons_callback, pattern=r"^(start:(help|ping|games|home)|games:puzzles|help:(handbook|group|moderation|filters|broadcast|tools|social|games|core|admin|aura|misc|home))$"))

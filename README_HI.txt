@@ -93,3 +93,15 @@ AUTO QUIZ (NEW)
 - Group mein pehla correct answer dene wale ko configured game reward (+3000 coins, +50 Aura) milta hai.
 - Timing change karne ke liye environment variable AUTO_QUIZ_INTERVAL_HOURS set karein (default 2).
 - Bot ko group mein send messages aur send photos permission chahiye. Group ko bot ke database mein known hona chahiye; bot ko group mein add karke ek message bhejein.
+
+
+GROUP QUIZ EVENT (UPDATED)
+--------------------------
+- /gamejoin starts a group quiz with up to 10 questions and a 10-minute time limit.
+- First correct answer advances to the next question. /endgame closes the event.
+- At close, the member with the most correct answers receives 3000 coins once. Quiz answers do not add Aura.
+- Positive/negative wording Aura still follows the existing sentiment detector and cooldown.
+- Reply to a member's message with /ban, /unban, /giveaura amount, /rob [amount]. Username targets work when the bot has seen that user.
+- Reply to text/sticker/photo/video/audio/document/etc. with /filter response to create a reply filter for that text or exact media.
+
+NOTE: The group game is memory-resident; a process restart closes an active game.

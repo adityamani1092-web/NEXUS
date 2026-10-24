@@ -4,6 +4,7 @@ import random
 import time
 import re
 import html
+import io
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
@@ -16,6 +17,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, ChatJoinRequestHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from db import (
     init_db, upsert_user, get_user_by_username, get_user_by_id, add_log,
@@ -23,7 +25,7 @@ from db import (
     add_media_filter, get_media_filters, get_media_filter, remove_media_filter,
     list_users, list_logs, get_settings, set_setting, get_stats, upsert_group_user, list_group_users,
     mark_dm_started, has_dm_started, adjust_score, get_score, leaderboard, buy_aura_protection,
-    get_name_history, remember_group, get_known_groups, get_broadcast_users,
+    get_name_history, remember_group, get_known_groups, get_broadcast_users, worldwide_leaderboard, can_award_message_aura,
     set_free_member, is_free_member
 )
 
@@ -144,7 +146,7 @@ def filter_add():
     if not keyword or len(keyword) > 100:
         flash("Keyword must be 1–100 characters.")
     else:
-        add_filter(keyword, response)
+        add_filter(keyword, response)  # dashboard filters are global owner-managed defaults
         add_log(OWNER_ID, "filter_add", None, f"keyword={keyword}")
         flash("Filter saved.")
     return redirect(url_for("home"))
@@ -190,12 +192,16 @@ async def command_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mark_dm_started(user.id)
     username = getattr(context.bot, "username", None)
     add_group_url = f"https://t.me/{username}?startgroup=true" if username else "https://t.me/"
-    keyboard = InlineKeyboardMarkup([
+    start_rows = [
         [InlineKeyboardButton("➕ ADD TO GROUP", url=add_group_url)],
         [InlineKeyboardButton("📚 HELP & COMMANDS", callback_data="start:help"), InlineKeyboardButton("🏓 PING", callback_data="start:ping")],
         [InlineKeyboardButton("🎮 GAMES", callback_data="start:games")],
         [InlineKeyboardButton("👑 OWNER: @Look_at_me60", url="https://t.me/Look_at_me60")],
-    ])
+    ]
+    # Private owner dashboard is intentionally hidden from ordinary users and groups.
+    if user and chat and chat.type == "private" and user.id == OWNER_ID:
+        start_rows.insert(0, [InlineKeyboardButton("📊 OWNER DASHBOARD", callback_data="owner:stats")])
+    keyboard = InlineKeyboardMarkup(start_rows)
     msg = update.effective_message
     if msg:
         private_note = "\n\n✅ DM activated — start me here before using group games." if chat and chat.type == "private" else "\n\n📩 To play, open my DM and press Start first."
@@ -224,82 +230,37 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await sent.edit_text(f"🏓 **Pong!**\n⚡ Response: `{elapsed} ms`\n🌹 Nexus Bot is online.", parse_mode="Markdown")
 
 HELP_CATEGORIES = {
-    "handbook": ("📖 HANDBOOK", """Welcome to NEXUS PREMIUM!
-
-Use the buttons below to browse commands. Group moderation commands need admin permissions. DM broadcasting only reaches users who have pressed /start."""),
-    "aura": ("✨ AURA", """/points — your points and Aura
-/top — group points leaderboard
-/auratop — Aura leaderboard
-/giveaura — give Aura to a member
-/protect 1d or /protect 2d — protect Aura using coins"""),
-    "tools": ("❖ TOOLS", """/imagine <prompt> — generate an AI image in this chat
-/image <prompt> — alias for /imagine
-/ping — check bot response time
-/id — show your ID and chat ID
-/info [@username|ID] or reply — user info
-/history [@username|ID] or reply — saved user history
-/translate hi|en|off — translation setting"""),
-    "social": ("℘ SOCIAL", """/couple — couple of the day / fresh pair
-/report reason — report a replied-to message to admins
-/adminlist — show group admins"""),
-    "games": ("# GAMES", """/hidden — missing-letter word
-/scramble — unscramble letters
-/anagram — rearrange letters
-/wordle — guess hidden word
-/hangman — guess the word
-/wordchain — word-chain prompt
-/fasttype — typing challenge
-/guessnumber — number guessing
-/riddle — solve a riddle
-/emojiquiz — emoji puzzle
-/mathquiz — maths challenge
-/truefalse — true/false quiz
-/trivia — general knowledge
-/puzzlehelp — game list"""),
-    "core": ("⌘ CORE", """/start — start bot and open menu
-/help — open this help menu
-/ping — response timing
-/filter keyword response — text auto-reply
-Reply to media with /filter response text — media auto-reply
-/filters — list filters"""),
-    "admin": ("🛡 ADMIN", """For group admins:
-/ban [target] or reply
-/unban [target] or reply
-/mute [target] [minutes] or reply
-/unmute [target] or reply
-/lock [type] — lock chat permissions
-/unlock [type] — unlock permissions
-/lockinfo — lock information
-/antispam on|off — spam protection
-/free and /unfree — manage exemptions
-/approve USER_ID or /decline USER_ID — join requests"""),
-    "misc": ("🌾 MISCELLANEOUS", """/broadcast message — owner: known groups + opted-in DMs
-/broadcastdm message — owner: DM users who pressed Start
-/broadcastgroups message — owner: groups
-/broadcast_at YYYY-MM-DD HH:MM message — schedule broadcast
-/setcoupleimage — owner: reply to a photo to set couple image
-
-🔞 Adult sticker filter checks configured sticker-set names; it cannot reliably identify explicit pixels."""),
+    "handbook": ("📖 HANDBOOK", "Welcome to NEXUS PREMIUM!\n\nUse the buttons below to browse group management, moderation, filters, games and social commands. Commands shown here are the features implemented in this build. Owner-only tools are labelled."),
+    "group": ("🛡 GROUP MANAGEMENT", "/antilink on|off — toggle link filtering\n/linkmode warn|mute — warning or mute action\n/linkwarn N — violations before mute\n/linkmute N — mute duration in minutes\n/approve USER_ID or reply/@username — allow a member to post links\n/unapprove USER_ID or reply/@username — revoke exception\n/ban [@username|USER_ID] or reply — ban member\n/unban [@username|USER_ID] or reply — unban member\n/mute [@username|USER_ID] [minutes] or reply — mute member\n/unmute [@username|USER_ID] or reply — unmute member\n/adminlist — list Telegram group admins\n/id — show user ID and chat ID (or reply)\n/info [@username|ID] — user information\n/history [@username|ID] — saved name/history information\n/decline USER_ID — decline a pending join request\n/lock [type] — lock a permission type\n/unlock [type] — unlock a permission type\n/lockinfo — show lock state\n\nUsername lookup works when Nexus has previously seen the user. The bot must be admin with the required permissions."),
+    "moderation": ("🚨 MODERATION & SAFETY", "/antilink on|off — remove links posted in group messages\n/linkmode warn|mute — choose warning or timed mute\n/linkwarn 3 — mute after this many link violations\n/linkmute 10 — mute duration in minutes\n/approve USER_ID or reply/@username — allow member through link filter\n/unapprove USER_ID or reply/@username — remove approval\n/ban [user ID/@username] or reply\n/unban [user ID/@username] or reply\n/mute [user ID/@username] [minutes] or reply\n/unmute [user ID/@username] or reply\n/antispam on|off — toggle spam checks\n/free [user] — exempt a member from selected checks\n/unfree [user] — remove exemption\n/report reason — report a replied-to message\n\nTelegram bot admin permissions are required for bans, mutes, and message restrictions. Profile bios cannot be read by Telegram bots; anti-link checks links in group messages."),
+    "filters": ("🔎 FILTERS & AUTOMATIC REPLIES", "/filter keyword response — add a text trigger\nReply to a text message with /filter response — create a reply filter\n/filter sticker response — reply to sticker media\n/filters — list filters for this group\n/stop keyword — remove a text filter\n\nThe configured owner or an administrator of this group can manage its filters. Filters are group-scoped."),
+    "games": ("🎮 GAMES & PUZZLES", "/couple — make a romantic couple card\n/hidden — missing-letter word game\n/scramble — unscramble a word\n/anagram — rearrange letters\n/wordle — guess a 5-letter word\n/hangman — guess a hidden word\n/wordchain — word-chain prompt\n/fasttype — typing challenge\n/guessnumber — number guessing\n/riddle — solve a riddle\n/emojiquiz — emoji puzzle\n/mathquiz — maths question\n/truefalse — true/false quiz\n/trivia — general knowledge\n/puzzlehelp — list all games\n\nPuzzle prompts are sent as a visual game card. First correct answer wins; each player must press /start in the bot DM first."),
+    "social": ("💞 SOCIAL & COMMUNITY", "/couple — select two group members and create a couple card\n/report reason — report a replied-to message\n/adminlist — list group administrators\n/points — show your coins and Aura\n/top — group leaderboard\n/auratop — group Aura leaderboard\n/worldtop — worldwide coins\n/worldauratop — worldwide Aura\n/giveaura — give Aura to a member\n/protect 1d or /protect 2d — protect Aura using coins\n/rob — try to rob coins from a member"),
+    "tools": ("🧰 TOOLS & AI", "/imagine <prompt> — generate an AI image in the current chat\n/image <prompt> — alias for /imagine\n/ping — check response time\n/id — show user/chat IDs\n/info [@username|ID] or reply — user information\n/history [@username|ID] or reply — tracked history\n/translate hi|en|off — translation setting\n\nAI image generation requires OPENAI_API_KEY, an available image model, and API billing/access."),
+    "broadcast": ("📢 OWNER BROADCAST TOOLS", "/broadcast message — broadcast to known groups and opted-in DMs\n/broadcastdm message — broadcast to users who pressed /start\n/broadcastgroups message — broadcast to groups\n/broadcast_at YYYY-MM-DD HH:MM message — schedule a broadcast\n\nThese commands are restricted to the configured bot owner."),
+    "core": ("⌘ CORE COMMANDS", "/start — open the main menu\n/help — open this help center\n/ping — response timing\n/filter — add a group filter\n/filters — list saved filters\n/stop keyword — remove a filter\n/imagine <prompt> — generate an image\n/couple — create a couple card\n/puzzlehelp — show game commands"),
+    "misc": ("🌾 MISCELLANEOUS", "/setcoupleimage — owner: reply to a photo to set the couple card background\n/broadcast, /broadcastdm, /broadcastgroups — owner-only broadcast tools\n\nLimitations: Nexus only knows history it has recorded. Telegram bots cannot read users' profile bios."),
 }
 
 def help_keyboard():
+    # Rose-inspired category grid, rendered in DM and usable from /help.
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▦ Handbook", callback_data="help:handbook")],
-        [InlineKeyboardButton("✿ Aura", callback_data="help:aura"), InlineKeyboardButton("❀ Auraboard", callback_data="help:aura")],
-        [InlineKeyboardButton("❖ Tools", callback_data="help:tools"), InlineKeyboardButton("℘ Social", callback_data="help:social")],
-        [InlineKeyboardButton("# Games", callback_data="help:games")],
-        [InlineKeyboardButton("⌘ Core", callback_data="help:core"), InlineKeyboardButton("🛡 Admin", callback_data="help:admin")],
+        [InlineKeyboardButton("🛡 Group Management", callback_data="help:group")],
+        [InlineKeyboardButton("🚨 Moderation", callback_data="help:moderation"), InlineKeyboardButton("🔎 Filters", callback_data="help:filters")],
+        [InlineKeyboardButton("👋 Greetings / Social", callback_data="help:social"), InlineKeyboardButton("🎮 Games", callback_data="help:games")],
+        [InlineKeyboardButton("🧰 Tools & AI", callback_data="help:tools"), InlineKeyboardButton("✨ Aura / Ranking", callback_data="help:social")],
+        [InlineKeyboardButton("📢 Broadcast (Owner)", callback_data="help:broadcast"), InlineKeyboardButton("⌘ Core", callback_data="help:core")],
         [InlineKeyboardButton("🌾 Miscellaneous", callback_data="help:misc")],
     ])
 
 async def show_help_menu(message):
     banner = os.path.join(os.path.dirname(__file__), "help_banner.jpg")
-    caption = "<b>🌌 NEXUS — HELP CENTER</b>\n\nChoose a category below to explore commands.\n👑 Owner: <a href=\"https://t.me/Look_at_me60\">@Look_at_me60</a>"
+    caption = "<b>🌌 NEXUS — HELP CENTER</b>\n\nChoose a category below to explore commands.\n🛡 Group Management • 🚨 Moderation • 🔎 Filters\n🎮 Games & Visual Puzzles • 🎨 AI Image Generator\n👑 Owner: <a href=\"https://t.me/Look_at_me60\">@Look_at_me60</a>"
     keyboard = help_keyboard()
     try:
         with open(banner, "rb") as photo:
             await message.reply_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=keyboard)
-    except (OSError, Exception):
+    except Exception:
         await message.reply_text(caption, parse_mode="HTML", reply_markup=keyboard)
 
 async def start_buttons_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -307,7 +268,13 @@ async def start_buttons_callback(update: Update, context: ContextTypes.DEFAULT_T
     if not query:
         return
     data = query.data or ""
-    if data == "start:help":
+    if data == "owner:stats":
+        if not query.from_user or query.from_user.id != OWNER_ID:
+            await query.answer("Owner only", show_alert=True)
+            return
+        await query.answer()
+        await send_owner_dashboard(query.message, context)
+    elif data == "start:help":
         await query.answer()
         await show_help_menu(query.message)
     elif data == "start:ping":
@@ -315,12 +282,11 @@ async def start_buttons_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.message.reply_text("🏓 Pong! NEXUS Bot is online. Use /ping for response timing.")
     elif data == "start:games":
         await query.answer()
-        games_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🧩 Puzzle Games", callback_data="games:puzzles")],
-            [InlineKeyboardButton("📖 All Game Commands", callback_data="help:games")],
+        await query.message.reply_text("🎮 <b>NEXUS GAMES</b>\n\nGroup games use image-based question cards. Open the bot DM and press Start before playing.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧩 Puzzle Games & Commands", callback_data="help:games")],
+            [InlineKeyboardButton("💞 Couple Card", callback_data="help:social")],
             [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="start:home")],
-        ])
-        await query.message.reply_text("🎮 <b>NEXUS GAMES</b>\n\nChoose a game category below. Games are played in groups.", parse_mode="HTML", reply_markup=games_keyboard)
+        ]))
     elif data == "games:puzzles":
         await query.answer()
         await query.message.reply_text(puzzle_help_text())
@@ -329,14 +295,55 @@ async def start_buttons_callback(update: Update, context: ContextTypes.DEFAULT_T
     elif data.startswith("help:"):
         await query.answer()
         key = data.split(":", 1)[1]
+        if key == "home":
+            await show_help_menu(query.message)
+            return
         title, body = HELP_CATEGORIES.get(key, HELP_CATEGORIES["handbook"])
         back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Help Menu", callback_data="help:home")]])
-        await query.message.reply_text(f"<b>{title}</b>\n\n{body}", parse_mode="HTML", reply_markup=back)
-    elif data == "help:home":
-        await query.answer()
-        await show_help_menu(query.message)
+        await query.message.reply_text(f"<b>{title}</b>\n\n{html.escape(body)}", parse_mode="HTML", reply_markup=back)
     else:
         await query.answer()
+
+async def send_owner_dashboard(message, context):
+    from db import get_owner_dashboard_stats
+    stats = get_owner_dashboard_stats()
+    admin_total = 0
+    admin_checked_groups = 0
+    admin_failures = 0
+    # Telegram only provides admin lists for groups the bot can still access.
+    for group_id in get_known_groups():
+        try:
+            admins = await context.bot.get_chat_administrators(int(group_id))
+            admin_total += len(admins)
+            admin_checked_groups += 1
+        except Exception:
+            admin_failures += 1
+    text = (
+        "📊 <b>NEXUS OWNER DASHBOARD</b>\n\n"
+        f"👥 <b>Users recorded:</b> {stats['recorded_users']}\n"
+        f"🚀 <b>Users who pressed /start in DM:</b> {stats['dm_started']}\n"
+        f"🤖 <b>Groups bot has recorded:</b> {stats['groups']}\n"
+        f"🧑‍🤝‍🧑 <b>Unique group members recorded:</b> {stats['unique_group_members']}\n"
+        f"📌 <b>Recorded group memberships:</b> {stats['group_memberships']}\n"
+        f"🛡️ <b>Admins across groups checked:</b> {admin_total}\n"
+        f"✅ <b>Groups admin list checked:</b> {admin_checked_groups}\n\n"
+        "<i>Counts include only users/groups the bot has observed. Telegram does not provide a global count of everyone who has added or started a bot. Admin totals can include the same person in multiple groups.</i>"
+    )
+    if admin_failures:
+        text += f"\n\n⚠️ Admin lists unavailable for {admin_failures} recorded group(s)."
+    await message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh Stats", callback_data="owner:stats")],
+    ]))
+
+
+async def ownerstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not actor_is_owner(update):
+        await safe_reply(update, "⛔ Ye command sirf bot owner ke liye hai.")
+        return
+    await tracked(update)
+    if update.effective_message:
+        await send_owner_dashboard(update.effective_message, context)
+
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await tracked(update)
@@ -835,9 +842,15 @@ def media_signature(message):
     return None
 
 async def filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not actor_is_owner(update):
-        await safe_reply(update, "⛔ Only the bot owner can add or change filters.")
+    # Owner can manage filters anywhere; other users must be Telegram admins of this group.
+    if not await caller_is_admin(update, context):
+        await safe_reply(update, "⛔ Filter lagane ke liye bot owner ya is group ka Telegram admin hona zaroori hai.")
         return
+    chat = update.effective_chat
+    if not actor_is_owner(update) and (not chat or chat.type not in ("group", "supergroup")):
+        await safe_reply(update, "⛔ Group filters ko manage karne ke liye group mein command use karo.")
+        return
+    filter_scope = chat.id if chat and chat.type in ("group", "supergroup") else 0
     msg = update.effective_message
     response = " ".join(context.args).strip()[:500]
     replied = msg.reply_to_message if msg else None
@@ -847,7 +860,7 @@ async def filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args and context.args[0].lower() in media_types and len(context.args) >= 2 and not (replied and (replied.text or replied.caption)):
         media_type = context.args[0].lower()
         response = " ".join(context.args[1:]).strip()[:500]
-        key = add_media_filter(media_type, "*", response)
+        key = add_media_filter(media_type, "*", response, filter_scope)
         add_log(update.effective_user.id, "media_type_filter_add", None, f"type={media_type}; key={key}")
         await safe_reply(update, f"✅ All {media_type} messages will trigger this reply: {response}")
         return
@@ -858,7 +871,7 @@ async def filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_reply(update, "Usage: reply to a sticker/media message with /filter your response text")
             return
         media_type, unique_id = signature
-        key = add_media_filter(media_type, unique_id, response)
+        key = add_media_filter(media_type, unique_id, response, filter_scope)
         add_log(update.effective_user.id, "media_filter_add", None, f"type={media_type}; key={key}")
         await safe_reply(update, f"✅ Exact {media_type} filter saved. When the same media is sent in a group, I will reply: {response}")
         return
@@ -868,7 +881,7 @@ async def filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not response:
             await safe_reply(update, "Reply to a text message with /filter your response text")
             return
-        add_filter(trigger, response)
+        add_filter(trigger, response, filter_scope)
         add_log(update.effective_user.id, "filter_add_from_reply", None, f"keyword={trigger[:80]}")
         await safe_reply(update, f"✅ Reply-based text filter saved for: {trigger}")
         return
@@ -878,20 +891,42 @@ async def filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     keyword = context.args[0].lower()[:100]
     response = " ".join(context.args[1:])[:500]
-    add_filter(keyword, response)
+    add_filter(keyword, response, filter_scope)
     add_log(update.effective_user.id, "filter_add", None, f"keyword={keyword}")
     await safe_reply(update, f"✅ Text filter added for: {keyword}")
 
 async def filters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await tracked(update)
-    rows = get_filters()
-    media_rows = get_media_filters()
+    if not await caller_is_admin(update, context):
+        await safe_reply(update, "⛔ Filters dekhne ke liye bot owner ya group admin hona zaroori hai.")
+        return
+    chat = update.effective_chat
+    scope = chat.id if chat and chat.type in ("group", "supergroup") else None
+    rows = get_filters(scope)
+    media_rows = get_media_filters(scope)
     lines = [f"• Text: {r['keyword']} → {r['response'] or '[delete only]'}" for r in rows[:30]]
     lines += [f"• Media: {r['media_type']} → {r['response'] or '[no reply]'} (key {r['media_key'][:24]}…)" for r in media_rows[:30]]
     if not lines:
         await safe_reply(update, "No filters configured.")
     else:
         await safe_reply(update, "Saved filters:\n" + "\n".join(lines))
+
+async def stop_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove a saved keyword filter; owner or a group admin only."""
+    if not await caller_is_admin(update, context):
+        await safe_reply(update, "⛔ Filter delete karne ke liye bot owner ya group admin hona zaroori hai.")
+        return
+    msg = update.effective_message
+    keyword = " ".join(context.args).strip().lower()
+    if not keyword and msg and msg.reply_to_message:
+        replied = msg.reply_to_message
+        keyword = (replied.text or replied.caption or "").strip().lower()[:100]
+    if not keyword:
+        await safe_reply(update, "Usage: /stop keyword  (ya us text par reply karke /stop)")
+        return
+    remove_filter(keyword, (update.effective_chat.id if update.effective_chat and update.effective_chat.type in ("group", "supergroup") else 0))
+    add_log(update.effective_user.id if update.effective_user else 0, "filter_delete", None, f"keyword={keyword[:100]}")
+    await safe_reply(update, f"🗑️ Filter removed: {keyword[:100]}")
 
 async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show profile for yourself by default, or a replied-to / specified user."""
@@ -1001,7 +1036,7 @@ async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, au
     if not chat or chat.type not in ("group", "supergroup"):
         await safe_reply(update, "Use this command inside a group."); return
     rows = leaderboard(chat.id, "aura_points" if aura else "total_points", 10)
-    title = "✨ AURA TOPLIST" if aura else "🪙 GROUP COIN TOPLIST"
+    title = "✨ GROUP AURA TOPLIST" if aura else "🪙 GROUP COIN TOPLIST"
     if not rows:
         await safe_reply(update, title + "\n\nNo scores yet — play a game or chat to start earning points!"); return
     lines = []
@@ -1016,6 +1051,20 @@ async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def auratop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await leaderboard_cmd(update, context, True)
+
+async def worldtop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = worldwide_leaderboard("total_points", 10)
+    if not rows:
+        await safe_reply(update, "🌍 WORLDWIDE COIN TOPLIST\n\nNo scores recorded yet."); return
+    lines = [f"{i}. {('@' + r['username']) if r.get('username') else (r.get('first_name') or str(r['user_id']))} — {r['score']} coins" for i, r in enumerate(rows, 1)]
+    await safe_reply(update, "🌍 WORLDWIDE COIN TOPLIST\n\n" + "\n".join(lines) + "\n\nScores are aggregated across groups where Nexus has recorded activity.")
+
+async def worldauratop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = worldwide_leaderboard("aura_points", 10)
+    if not rows:
+        await safe_reply(update, "🌍 WORLDWIDE AURA TOPLIST\n\nNo Aura scores recorded yet."); return
+    lines = [f"{i}. {('@' + r['username']) if r.get('username') else (r.get('first_name') or str(r['user_id']))} — {r['score']} Aura" for i, r in enumerate(rows, 1)]
+    await safe_reply(update, "🌍 WORLDWIDE AURA TOPLIST\n\n" + "\n".join(lines) + "\n\nScores are aggregated across groups where Nexus has recorded activity.")
 
 async def giveaura_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat, user = update.effective_chat, update.effective_user
@@ -1099,7 +1148,134 @@ async def lockinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = get_settings().get(f"lock:{chat.id}", "off")
     await safe_reply(update, f"🔐 NEXUS LOCK STATUS\nCurrent lock: {status}\nCommands: /lock, /lock stickers, /unlock, /lockinfo")
 
+def is_link_message(msg):
+    """Detect links in message text/caption. Telegram bots cannot read a member profile bio."""
+    raw = (msg.text or msg.caption or "")
+    if re.search(r"(?i)(https?://|www\.|t\.me/|telegram\.me/|discord\.(gg|com/invite)/|bit\.ly/|tinyurl\.com/)", raw):
+        return True
+    entities = list(msg.entities or []) + list(msg.caption_entities or [])
+    return any(getattr(entity, "type", "") in ("url", "text_link") for entity in entities)
+
+
+def link_approved(chat_id, user_id):
+    return get_settings().get(f"linkapproved:{int(chat_id)}:{int(user_id)}", "0") == "1"
+
+
+async def antilink_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await caller_is_admin(update, context):
+        await safe_reply(update, "⛔ Only group admins can configure anti-link."); return
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup"):
+        await safe_reply(update, "Use /antilink on or /antilink off inside a group."); return
+    value = context.args[0].lower() if context.args else ""
+    if value not in ("on", "off"):
+        await safe_reply(update, "🔗 Anti-link settings\n/antilink on — delete links from unapproved members\n/antilink off — disable link filtering\n/linkmode warn|mute\n/linkwarn 3\n/linkmute 10"); return
+    set_setting(f"antilink:{chat.id}", value)
+    await safe_reply(update, f"🔗 Anti-link is now {value.upper()} in this group. Note: this checks links in messages, not profile bios (Telegram Bot API does not expose bios to bots).")
+
+
+async def linkmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await caller_is_admin(update, context):
+        await safe_reply(update, "⛔ Only group admins can configure link mode."); return
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup"):
+        await safe_reply(update, "Use /linkmode warn or /linkmode mute in a group."); return
+    mode = context.args[0].lower() if context.args else ""
+    if mode not in ("warn", "mute"):
+        await safe_reply(update, "Usage: /linkmode warn OR /linkmode mute"); return
+    set_setting(f"linkmode:{chat.id}", mode)
+    await safe_reply(update, f"✅ Anti-link action set to: {mode}. In mute mode, user is muted after the configured warning threshold.")
+
+
+async def linkwarn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await caller_is_admin(update, context):
+        await safe_reply(update, "⛔ Only group admins can configure link warnings."); return
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup"):
+        await safe_reply(update, "Use /linkwarn N in a group."); return
+    try: n = int(context.args[0]) if context.args else 3
+    except ValueError: n = 0
+    if not 1 <= n <= 10:
+        await safe_reply(update, "Usage: /linkwarn 1-10 (default 3)"); return
+    set_setting(f"linkwarn:{chat.id}", str(n))
+    await safe_reply(update, f"✅ Link warning threshold set to {n}.")
+
+
+async def linkmute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await caller_is_admin(update, context):
+        await safe_reply(update, "⛔ Only group admins can configure link mute duration."); return
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup"):
+        await safe_reply(update, "Use /linkmute minutes in a group."); return
+    try: minutes = int(context.args[0]) if context.args else 10
+    except ValueError: minutes = 0
+    if not 1 <= minutes <= 10080:
+        await safe_reply(update, "Usage: /linkmute 1-10080 (minutes; default 10)"); return
+    set_setting(f"linkmute:{chat.id}", str(minutes))
+    await safe_reply(update, f"✅ Link violation mute duration set to {minutes} minute(s).")
+
+
+async def linkapproval_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Approve/unapprove a member for the anti-link rule; supports reply, ID, known username."""
+    if not await caller_is_admin(update, context):
+        await safe_reply(update, "⛔ Only group admins can approve link exceptions."); return
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup"):
+        await safe_reply(update, "Use this command inside a group."); return
+    target = await resolve_target(update, context)
+    if not target:
+        await safe_reply(update, "Reply to a member or use /approve USER_ID or /approve @username (username must be known to Nexus)."); return
+    cmd = (update.effective_message.text or "").split()[0].split("@")[0].lower()
+    enabled = cmd == "/approve"
+    set_setting(f"linkapproved:{chat.id}:{target}", "1" if enabled else "0")
+    add_log(update.effective_user.id, "link_approved" if enabled else "link_unapproved", target, f"chat={chat.id}")
+    await safe_reply(update, ("✅ Approved" if enabled else "🚫 Approval removed for") + f" user ID {target}. " + ("They may post links without anti-link action." if enabled else "Their links will be moderated again."))
+
+
+async def enforce_antilink(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not chat or not user or user.is_bot or chat.type not in ("group", "supergroup"):
+        return False
+    settings = get_settings()
+    if settings.get(f"antilink:{chat.id}", "off") != "on" or not is_link_message(msg):
+        return False
+    if link_approved(chat.id, user.id) or is_free_member(chat.id, user.id):
+        return False
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        if member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            return False
+    except Exception:
+        pass
+    try:
+        await msg.delete()
+    except Exception:
+        # Continue with warning/mute; deletion requires Delete Messages permission.
+        pass
+    key = f"linkwarnings:{chat.id}:{user.id}"
+    warnings = context.application.bot_data.setdefault("link_warnings", {})
+    warnings[key] = warnings.get(key, 0) + 1
+    threshold = max(1, int(settings.get(f"linkwarn:{chat.id}", "3") or 3))
+    mode = settings.get(f"linkmode:{chat.id}", "warn")
+    if mode == "mute" and warnings[key] >= threshold:
+        minutes = max(1, int(settings.get(f"linkmute:{chat.id}", "10") or 10))
+        until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+        try:
+            await context.bot.restrict_chat_member(chat.id, user.id, permissions=ChatPermissions(can_send_messages=False), until_date=until)
+            await context.bot.send_message(chat.id, f"🔇 {user.mention_html()} muted for {minutes} minute(s) after repeated link violations. Admins can use /approve by reply/ID/@username to exempt a member.", parse_mode="HTML")
+            warnings[key] = 0
+        except Exception:
+            await context.bot.send_message(chat.id, f"⚠️ {user.mention_html()}, links are not allowed. Warning {warnings[key]}/{threshold}. Bot needs Restrict Members permission to mute.", parse_mode="HTML")
+    else:
+        await context.bot.send_message(chat.id, f"⚠️ {user.mention_html()}, links are not allowed in this group. Warning {warnings[key]}/{threshold}. Ask an admin to approve you if needed.", parse_mode="HTML")
+    return True
+
+
 async def approval_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    command_name = (update.effective_message.text or "").split()[0].split("@")[0].lower() if update.effective_message else ""
+    if command_name == "/approve":
+        await linkapproval_cmd(update, context)
+        return
     if not await caller_is_admin(update, context):
         await safe_reply(update, "⛔ Only the owner or a group admin can approve/decline join requests."); return
     chat = update.effective_chat
@@ -1142,15 +1318,17 @@ async def aura_for_message(update: Update):
     pos = sum(1 for w in words if w in POSITIVE_WORDS)
     neg = sum(1 for w in words if w in NEGATIVE_WORDS)
     if pos or neg:
-        # Premium Aura economy: +100 for each positive word, -200 for each negative word.
-        # Cap one message to prevent a single huge message from dominating the leaderboard.
-        delta = max(-2000, min(1000, pos * 100 - neg * 200))
+        # +50 per positive word and -50 per negative word, capped at +/-500 per message.
+        # One qualifying Aura event per user/group every 60 seconds helps prevent farming.
+        if not can_award_message_aura(chat.id, user.id, 60):
+            return
+        delta = max(-500, min(500, (pos - neg) * 50))
         before = get_score(chat.id, user.id) or {"aura_points": 0}
         row = adjust_score(chat.id, user.id, user.username, user.first_name, aura_delta=delta)
         actual_delta = int(row["aura_points"]) - int(before["aura_points"])
         if actual_delta:
             context_text = f"✨ +{actual_delta} Aura" if actual_delta > 0 else f"🌑 {actual_delta} Aura"
-            await msg.reply_text(f"🌌 𝗡𝗘𝗫𝗨𝗦 𝗔𝗨𝗥𝗔\n{context_text}\n💠 Total Aura: {row['aura_points']}")
+            await msg.reply_text(f"🌌 𝗡𝗘𝗫𝗨𝗦 𝗔𝗨𝗥𝗔\n{context_text}\n💠 Total Aura: {row['aura_points']}\n⏳ Sentiment reward cooldown: 60 seconds")
     else:
         # Ensure user appears on this group's points tables.
         adjust_score(chat.id, user.id, user.username, user.first_name)
@@ -1259,6 +1437,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not chat or chat.type not in ("group", "supergroup"):
         return
     remember_group(chat.id, chat.title or str(chat.id))
+    if await enforce_antilink(update, context):
+        return
     if await check_antispam(update, context):
         return
     if await remove_adult_sticker(update, context):
@@ -1301,7 +1481,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     signature = media_signature(msg)
     if signature:
-        row = get_media_filter(signature[0], signature[1])
+        row = get_media_filter(signature[0], signature[1], chat.id)
         if row and row["response"]:
             try:
                 await msg.reply_text(row["response"])
@@ -1314,16 +1494,20 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg.text:
         return
     text = msg.text.lower()
-    for row in get_filters():
+    for row in get_filters(chat.id):
         if row["keyword"] in text:
+            # Reply must still work if the bot lacks Delete Messages permission.
             try:
                 await msg.delete()
-                if row["response"]:
-                    await context.bot.send_message(chat.id, row["response"])
-                add_log(0, "filter_match", update.effective_user.id if update.effective_user else None,
-                        f"keyword={row['keyword']}; chat={chat.id}")
             except Exception:
                 pass
+            if row["response"]:
+                try:
+                    await context.bot.send_message(chat.id, row["response"])
+                except Exception as exc:
+                    print(f"Filter reply failed: {type(exc).__name__}")
+            add_log(0, "filter_match", update.effective_user.id if update.effective_user else None,
+                    f"keyword={row['keyword']}; chat={chat.id}")
             break
 
 # --- Fun group features: couples and mini puzzle games ---
@@ -1423,6 +1607,38 @@ def puzzle_help_text():
             "/puzzlehelp — show these games\n"
             "First correct answer wins. Games run in groups.")
 
+def _make_game_card(title: str, prompt: str):
+    """Create a shareable visual question card for group mini-games."""
+    W, H = 1000, 560
+    im = Image.new("RGB", (W, H), (17, 25, 48))
+    d = ImageDraw.Draw(im)
+    # layered gradient background
+    for y in range(H):
+        t = y / max(1, H - 1)
+        color = (int(21 + 40*t), int(30 + 18*t), int(68 + 65*t))
+        d.line((0, y, W, y), fill=color)
+    d.rounded_rectangle((35, 35, W-35, H-35), radius=32, outline=(139, 195, 255), width=4, fill=(18, 30, 62))
+    d.text((70, 68), "NEXUS  •  MINI GAME", font=_couple_font(28, True), fill=(143, 220, 255))
+    d.text((70, 130), str(title)[:70], font=_couple_font(44, True), fill=(255, 220, 130))
+    # wrap prompt to fit the card
+    font = _couple_font(34, True)
+    words = str(prompt).split()
+    lines, line = [], ""
+    for word in words:
+        candidate = (line + " " + word).strip()
+        if d.textbbox((0, 0), candidate, font=font)[2] > W - 150 and line:
+            lines.append(line); line = word
+        else:
+            line = candidate
+    if line: lines.append(line)
+    y = 220
+    for line in lines[:5]:
+        d.text((70, y), line[:80], font=font, fill=(255, 255, 255))
+        y += 52
+    d.text((70, H-92), "Reply in group with your answer  •  First correct answer wins", font=_couple_font(21), fill=(190, 211, 240))
+    out = io.BytesIO(); im.save(out, format="JPEG", quality=90); out.seek(0); out.name = "nexus_game_card.jpg"
+    return out
+
 async def start_puzzle(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str):
     if not await dm_game_gate(update, context):
         return
@@ -1461,7 +1677,8 @@ async def start_puzzle(update: Update, context: ContextTypes.DEFAULT_TYPE, kind:
         prompt, answer = random.choice(PUZZLE_BANK["riddle"])
     ACTIVE_PUZZLES[chat.id] = {"answer": answer.casefold(), "kind": kind, "started": time.time()}
     labels = {"hidden": "🔤 Hidden Letter", "scramble": "🔀 Word Scramble", "riddle": "🧠 Riddle", "emoji": "🎭 Emoji Puzzle", "math": "➗ Math Challenge", "anagram": "🔠 Anagram", "wordle": "🟩 Word Guess", "hangman": "🪢 Hangman Word", "wordchain": "🔗 Word Chain", "guessnumber": "🔢 Guess Number", "fasttype": "⚡ Fast Type", "truefalse": "✅ True or False", "trivia": "🌍 Trivia Quiz"}
-    await msg.reply_text(f"{labels[kind]}\n\n{prompt}\n\nReply in chat with your answer!")
+    card = _make_game_card(labels[kind], prompt)
+    await msg.reply_photo(photo=card, caption=f"🎮 <b>{html.escape(labels[kind])}</b>\n\n{html.escape(prompt)}\n\nReply in group with your answer!", parse_mode="HTML")
 
 async def hidden_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_puzzle(update, context, "hidden")
@@ -1520,6 +1737,83 @@ async def set_couple_image_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     set_setting("couple_image_file_id", replied.photo[-1].file_id)
     await safe_reply(update, "🌹 Couple image saved. Use /couple to test it.")
 
+def _couple_font(size, bold=False):
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            pass
+    return ImageFont.load_default()
+
+async def _couple_avatar(context, user_id, name, size=240):
+    """Download a Telegram profile photo; fall back to a pastel initials avatar."""
+    try:
+        photos = await context.bot.get_user_profile_photos(user_id=int(user_id), limit=1)
+        if photos.total_count and photos.photos:
+            tg_file = await context.bot.get_file(photos.photos[0][-1].file_id)
+            raw = await tg_file.download_as_bytearray()
+            im = Image.open(io.BytesIO(raw)).convert("RGB")
+            return ImageOps.fit(im, (size, size), method=Image.Resampling.LANCZOS)
+    except Exception:
+        pass
+    im = Image.new("RGB", (size, size), (255, 221, 229))
+    d = ImageDraw.Draw(im)
+    initials = "".join(part[0] for part in str(name).split()[:2] if part)[:2].upper() or "?"
+    font = _couple_font(size // 3, True)
+    box = d.textbbox((0, 0), initials, font=font)
+    d.text(((size-(box[2]-box[0]))/2, (size-(box[3]-box[1]))/2-box[1]), initials, fill=(170, 42, 79), font=font)
+    return im
+
+async def _make_couple_card(context, first, second):
+    """Create a pink couple card similar to the requested Telegram screenshot."""
+    W, H = 1000, 600
+    im = Image.new("RGB", (W, H), (255, 211, 216))
+    pix = im.load()
+    # soft vertical pink gradient
+    for y in range(H):
+        t = y / max(1, H-1)
+        color = (int(255-13*t), int(174+40*t), int(183+38*t))
+        for x in range(W): pix[x, y] = color
+    d = ImageDraw.Draw(im)
+    # decorative sparkles
+    for x,y in [(80,90),(900,80),(100,500),(900,500),(500,70),(500,530)]:
+        d.ellipse((x-5,y-5,x+5,y+5), fill=(255,245,246))
+    a_name = first.get('first_name') or first.get('username') or str(first['user_id'])
+    b_name = second.get('first_name') or second.get('username') or str(second['user_id'])
+    a = await _couple_avatar(context, first['user_id'], a_name)
+    b = await _couple_avatar(context, second['user_id'], b_name)
+    avatar_size = 270
+    positions = [(125,145),(605,145)]
+    for avatar,(x,y) in zip((a,b),positions):
+        # white ring
+        d.ellipse((x-9,y-9,x+avatar_size+9,y+avatar_size+9), fill=(255,255,255))
+        mask = Image.new('L',(avatar_size,avatar_size),0)
+        ImageDraw.Draw(mask).ellipse((0,0,avatar_size-1,avatar_size-1),fill=255)
+        im.paste(avatar.resize((avatar_size,avatar_size)),(x,y),mask)
+    # draw a red heart from a parametric curve
+    pts=[]
+    for i in range(240):
+        t=2*3.141592653589793*i/240
+        xx=16*(__import__('math').sin(t)**3)
+        yy=13*__import__('math').cos(t)-5*__import__('math').cos(2*t)-2*__import__('math').cos(3*t)-__import__('math').cos(4*t)
+        pts.append((int(500+xx*5.1),int(285-yy*5.1)))
+    d.polygon(pts, fill=(219,22,63), outline=(255,255,255))
+    d.text((500,455), "♥", font=_couple_font(1), fill=(219,22,63))
+    f1=_couple_font(29, True); f2=_couple_font(25, True)
+    def centered(text,y,font,fill):
+        bb=d.textbbox((0,0),text,font=font)
+        d.text(((W-(bb[2]-bb[0]))/2,y),text,font=font,fill=fill)
+    centered(str(a_name)[:25], 445, f1, (95,24,47))
+    centered("+", 485, f2, (255,255,255))
+    centered(str(b_name)[:25], 518, f1, (95,24,47))
+    out=io.BytesIO(); im.save(out,format='JPEG',quality=90); out.seek(0)
+    out.name='nexus_couple.jpg'
+    return out
+
 async def couple_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await dm_game_gate(update, context):
         return
@@ -1544,51 +1838,48 @@ async def couple_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         remaining = int(COUPLE_COOLDOWN_SECONDS - (now - last))
         hours, rem = divmod(remaining, 3600)
         minutes = rem // 60
-        await msg.reply_text(f"💞 A new group couple is available every 6 hours. Try again in {hours}h {minutes}m, or reply to a member's message with /couple to make a fresh pair.")
+        await msg.reply_text(f"💞 Today's couple has already been selected! Next selection in {hours}h {minutes}m. Reply to a member's message with /couple to make a fresh pair.")
         return
 
-    # Prefer users seen in the group/chat where possible; Telegram does not expose a full member list.
     candidates = []
-    if replied_user:
+    if replied_user and not replied_user.is_bot:
         upsert_user(replied_user.id, replied_user.username, replied_user.first_name)
         upsert_group_user(chat.id, replied_user.id, replied_user.username, replied_user.first_name)
-        candidates.append({"user_id": replied_user.id, "first_name": replied_user.first_name or replied_user.username or str(replied_user.id)})
+        candidates.append({"user_id": replied_user.id, "username": replied_user.username, "first_name": replied_user.first_name or replied_user.username or str(replied_user.id)})
     for row in list_group_users(chat.id, 500):
-        if int(row["user_id"]) not in {c["user_id"] for c in candidates}:
-            candidates.append({"user_id": int(row["user_id"]), "first_name": row.get("first_name") or ("@" + row["username"] if row.get("username") else str(row["user_id"]))})
+        uid = int(row["user_id"])
+        if uid not in {c["user_id"] for c in candidates}:
+            candidates.append({"user_id": uid, "username": row.get("username"), "first_name": row.get("first_name") or ("@" + row["username"] if row.get("username") else str(uid))})
     candidates = [c for c in candidates if c["user_id"] != getattr(context.bot, "id", None)]
     if len(candidates) < 2:
         await msg.reply_text("💞 I need at least two known group members. Ask members to send a message, then try /couple again.")
         return
-    if replied_user:
+    if replied_user and not replied_user.is_bot:
         possible = [c for c in candidates if c["user_id"] != replied_user.id]
         if not possible:
             await msg.reply_text("I need one more known member to make a couple.")
             return
-        first = candidates[0]
-        second = random.choice(possible)
+        first, second = candidates[0], random.choice(possible)
     else:
         first, second = random.sample(candidates, 2)
     set_setting(key, str(now))
-    def display_user(row):
-        uid = int(row["user_id"])
-        username = row.get("username")
-        name = row.get("first_name") or (f"@{username}" if username else str(uid))
-        handle = f"@{username}" if username else "No username"
-        return f"{name} ({handle})\\n🆔 ID: {uid}"
-    caption = ("💘 <b>NEXUS NEW COUPLE</b> 💘\\n\\n"
-               f"🖤 <b>Member 1:</b> {html.escape(display_user(first))}\\n"
-               f"💗 <b>Member 2:</b> {html.escape(display_user(second))}\\n\\n"
-               f"✨ Compatibility: {random.randint(60, 100)}%")
 
-    image_id = get_settings().get("couple_image_file_id", "").strip()
+    def display_user(row):
+        username = row.get("username")
+        name = row.get("first_name") or (f"@{username}" if username else str(row["user_id"]))
+        return f"{name} (@{username})" if username else name
+    first_name, second_name = display_user(first), display_user(second)
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).astimezone(timezone(timedelta(hours=5, minutes=30))).strftime("%d/%m/%Y")
+    caption = ("💞 <b>Today's Couple of the Day</b> 💞\n\n"
+               f"💗 {html.escape(first_name)} + {html.escape(second_name)}\n"
+               f"💚 Mani = 💚\n\n"
+               f"❞ Next couples will be selected on {tomorrow}!! ❞")
     try:
-        if image_id:
-            await context.bot.send_photo(chat_id=chat.id, photo=image_id, caption=caption)
-        else:
-            await msg.reply_text(caption + "\n\nOwner: reply to a photo with /setcoupleimage to add the couple image.")
-    except Exception:
-        await msg.reply_text(caption + "\n\n(Couple image could not be loaded.)")
+        card = await _make_couple_card(context, first, second)
+        await context.bot.send_photo(chat_id=chat.id, photo=card, caption=caption, parse_mode="HTML")
+    except Exception as e:
+        # Preserve a useful text result if profile photos or image rendering fail.
+        await msg.reply_text(caption + f"\n\n(Visual card unavailable: {html.escape(str(e)[:120])})", parse_mode="HTML")
 
 async def automatic_couple_for_group(bot, chat_id):
     """Post and pin a couple in a group every six hours while the bot is online."""
@@ -1635,6 +1926,77 @@ async def couple_scheduler(bot):
             print(f"Auto-couple failed in group {chat_id}: {type(e).__name__}")
             set_setting(key, str(now + 900))
 
+# --- Automatic group quiz: one fresh question every two hours ---
+AUTO_QUIZ_INTERVAL_SECONDS = max(1, int(os.getenv("AUTO_QUIZ_INTERVAL_HOURS", "2"))) * 3600
+
+
+def _auto_quiz_pool():
+    """Build a mixed pool of general knowledge, true/false and riddle questions."""
+    pool = []
+    for prompt, answer in PUZZLE_BANK.get("trivia", []):
+        pool.append(("🌍 General Knowledge Quiz", prompt, answer))
+    for prompt, answer in PUZZLE_BANK.get("truefalse", []):
+        pool.append(("✅ True or False Quiz", prompt, answer))
+    for prompt, answer in PUZZLE_BANK.get("riddle", []):
+        pool.append(("🧠 Riddle Quiz", prompt, answer))
+    # Add a few extra questions so the automatic cycle has more variety.
+    pool.extend([
+        ("🌍 General Knowledge Quiz", "Which is the largest planet in our Solar System?", "jupiter"),
+        ("🌍 General Knowledge Quiz", "How many sides does an octagon have?", "8"),
+        ("🌍 General Knowledge Quiz", "Which language is primarily used to style web pages?", "css"),
+        ("🌍 General Knowledge Quiz", "What is the chemical symbol for gold?", "au"),
+        ("🌍 General Knowledge Quiz", "Which organ pumps blood around the human body?", "heart"),
+        ("🌍 General Knowledge Quiz", "How many hours are there in two days?", "48"),
+        ("🌍 General Knowledge Quiz", "Which is the nearest star to Earth?", "sun"),
+        ("🌍 General Knowledge Quiz", "What is the square root of 81?", "9"),
+    ])
+    return pool
+
+
+async def auto_quiz_scheduler(bot):
+    """Post a different visual quiz in every known group on a persisted 2-hour cycle."""
+    now = time.time()
+    settings = get_settings()
+    pool = _auto_quiz_pool()
+    if not pool:
+        return
+    for raw_chat_id in get_known_groups():
+        chat_id = int(raw_chat_id)
+        next_key = f"auto_quiz_next:{chat_id}"
+        try:
+            next_at = float(settings.get(next_key, "0"))
+        except (TypeError, ValueError):
+            next_at = 0
+        if now < next_at:
+            continue
+        last_key = f"auto_quiz_last:{chat_id}"
+        last_prompt = settings.get(last_key, "")
+        candidates = [i for i, item in enumerate(pool) if item[1] != last_prompt]
+        idx = random.choice(candidates or list(range(len(pool))))
+        title, prompt, answer = pool[idx]
+        try:
+            card = _make_game_card(title, prompt)
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=card,
+                caption=(f"🎮 <b>NEXUS AUTO QUIZ</b>\n\n{html.escape(prompt)}\n\n"
+                         f"⏱️ Next question in about {AUTO_QUIZ_INTERVAL_SECONDS // 3600} hour(s).\n"
+                         "💬 Reply in this group with your answer!\n"
+                         "🏆 First correct answer wins: +3000 coins and +50 Aura."),
+                parse_mode="HTML",
+            )
+            ACTIVE_PUZZLES[chat_id] = {
+                "answer": answer.casefold().strip(), "kind": "trivia",
+                "started": now, "auto_quiz": True,
+            }
+            set_setting(last_key, prompt)
+            set_setting(next_key, str(now + AUTO_QUIZ_INTERVAL_SECONDS))
+        except Exception as e:
+            print(f"Auto-quiz failed in group {chat_id}: {type(e).__name__}")
+            # Retry later if the bot was temporarily unable to post.
+            set_setting(next_key, str(now + 900))
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     # Do not log secrets or full update payloads.
     print(f"Bot handler error: {type(context.error).__name__}")
@@ -1642,6 +2004,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 def build_bot():
     bot_app = Application.builder().token(BOT_TOKEN).build()
     bot_app.add_handler(CommandHandler("start", command_start))
+    bot_app.add_handler(CommandHandler("ownerstats", ownerstats_cmd))
     bot_app.add_handler(CommandHandler("help", help_cmd))
     bot_app.add_handler(CommandHandler("ping", ping_cmd))
     bot_app.add_handler(CommandHandler("imagine", imagine_cmd))
@@ -1651,6 +2014,8 @@ def build_bot():
     bot_app.add_handler(CommandHandler("points", points_cmd))
     bot_app.add_handler(CommandHandler("top", top_cmd))
     bot_app.add_handler(CommandHandler("auratop", auratop_cmd))
+    bot_app.add_handler(CommandHandler("worldtop", worldtop_cmd))
+    bot_app.add_handler(CommandHandler("worldauratop", worldauratop_cmd))
     bot_app.add_handler(CommandHandler("protect", protect_cmd))
     bot_app.add_handler(CommandHandler("lock", lock_cmd))
     bot_app.add_handler(CommandHandler("unlock", unlock_cmd))
@@ -1658,6 +2023,11 @@ def build_bot():
     bot_app.add_handler(CommandHandler("giveaura", giveaura_cmd))
     bot_app.add_handler(CommandHandler("approve", approval_cmd))
     bot_app.add_handler(CommandHandler("decline", approval_cmd))
+    bot_app.add_handler(CommandHandler("unapprove", linkapproval_cmd))
+    bot_app.add_handler(CommandHandler("antilink", antilink_cmd))
+    bot_app.add_handler(CommandHandler("linkmode", linkmode_cmd))
+    bot_app.add_handler(CommandHandler("linkwarn", linkwarn_cmd))
+    bot_app.add_handler(CommandHandler("linkmute", linkmute_cmd))
     bot_app.add_handler(CommandHandler("rob", rob_cmd))
     bot_app.add_handler(CommandHandler("id", id_cmd))
     bot_app.add_handler(CommandHandler("info", info_cmd))
@@ -1676,6 +2046,7 @@ def build_bot():
     bot_app.add_handler(CommandHandler("unmute", unmute_cmd))
     bot_app.add_handler(CommandHandler("filter", filter_cmd))
     bot_app.add_handler(CommandHandler("filters", filters_cmd))
+    bot_app.add_handler(CommandHandler("stop", stop_filter_cmd))
     bot_app.add_handler(CommandHandler("couple", couple_cmd))
     bot_app.add_handler(CommandHandler("newcouple", couple_cmd))
     bot_app.add_handler(CommandHandler("setcoupleimage", set_couple_image_cmd))
@@ -1695,7 +2066,7 @@ def build_bot():
     bot_app.add_handler(CommandHandler("puzzlehelp", puzzlehelp_cmd))
     bot_app.add_handler(ChatJoinRequestHandler(join_request))
     bot_app.add_handler(CallbackQueryHandler(join_request_action, pattern=r"^jr:(approve|decline):-?\d+:\d+$"))
-    bot_app.add_handler(CallbackQueryHandler(start_buttons_callback, pattern=r"^(start:(help|ping|games|home)|games:puzzles|help:(handbook|aura|tools|social|games|core|admin|misc|home))$"))
+    bot_app.add_handler(CallbackQueryHandler(start_buttons_callback, pattern=r"^(start:(help|ping|games|home)|games:puzzles|help:(handbook|group|moderation|filters|broadcast|tools|social|games|core|admin|aura|misc|home))$"))
     bot_app.add_handler(MessageHandler((filters.ALL & ~filters.COMMAND), on_message))
     bot_app.add_error_handler(error_handler)
     return bot_app
@@ -1706,9 +2077,10 @@ async def run_bot():
     await bot_app.start()
     await bot_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     try:
-        # Run the persisted auto-couple scheduler; it checks groups every minute.
+        # Persisted schedules: couples and a fresh quiz in known groups.
         while True:
             await couple_scheduler(bot_app.bot)
+            await auto_quiz_scheduler(bot_app.bot)
             await asyncio.sleep(60)
     finally:
         await bot_app.updater.stop()

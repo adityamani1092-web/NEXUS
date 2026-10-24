@@ -37,6 +37,16 @@ def init_db(owner_id):
           media_key TEXT PRIMARY KEY, media_type TEXT NOT NULL, file_unique_id TEXT NOT NULL,
           response TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
         );
+        -- Scoped filter tables keep each group's admins from changing filters in other groups.
+        CREATE TABLE IF NOT EXISTS filters_scoped(
+          chat_id INTEGER NOT NULL DEFAULT 0, keyword TEXT NOT NULL COLLATE NOCASE,
+          response TEXT NOT NULL DEFAULT '', PRIMARY KEY(chat_id, keyword)
+        );
+        CREATE TABLE IF NOT EXISTS media_filters_scoped(
+          chat_id INTEGER NOT NULL DEFAULT 0, media_key TEXT NOT NULL, media_type TEXT NOT NULL,
+          file_unique_id TEXT NOT NULL, response TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+          PRIMARY KEY(chat_id, media_key)
+        );
         CREATE TABLE IF NOT EXISTS logs(
           id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL,
           actor_id INTEGER NOT NULL DEFAULT 0, action TEXT NOT NULL,
@@ -49,6 +59,10 @@ def init_db(owner_id):
           aura_protect_until REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
           PRIMARY KEY(chat_id,user_id)
         );
+        CREATE TABLE IF NOT EXISTS aura_message_cooldowns(
+          chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, last_award REAL NOT NULL DEFAULT 0,
+          PRIMARY KEY(chat_id,user_id)
+        );
         """)
         # Safe migration for databases created by earlier RoseBot versions.
         user_columns = {row[1] for row in c.execute("PRAGMA table_info(users)").fetchall()}
@@ -56,6 +70,9 @@ def init_db(owner_id):
             c.execute("ALTER TABLE users ADD COLUMN dm_started INTEGER NOT NULL DEFAULT 0")
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('owner_id',?)", (str(owner_id),))
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('auto_approve','0')")
+        # Preserve filters from older versions as global filters (chat_id=0).
+        c.execute("INSERT OR IGNORE INTO filters_scoped(chat_id,keyword,response) SELECT 0,keyword,response FROM filters")
+        c.execute("INSERT OR IGNORE INTO media_filters_scoped(chat_id,media_key,media_type,file_unique_id,response,created_at) SELECT 0,media_key,media_type,file_unique_id,response,created_at FROM media_filters")
 
 def upsert_user(user_id, username, first_name):
     username = username.lstrip("@") if username else None
@@ -122,44 +139,56 @@ def get_owner_id():
         row = c.execute("SELECT value FROM settings WHERE key='owner_id'").fetchone()
         return int(row["value"]) if row else 0
 
-def get_filters():
+def get_filters(chat_id=None):
     with connect() as c:
-        return [dict(r) for r in c.execute("SELECT keyword,response FROM filters ORDER BY keyword LIMIT 200").fetchall()]
+        if chat_id is None:
+            rows = c.execute("SELECT chat_id,keyword,response FROM filters_scoped ORDER BY chat_id,keyword LIMIT 500").fetchall()
+        else:
+            rows = c.execute("SELECT chat_id,keyword,response FROM filters_scoped WHERE chat_id IN (0,?) ORDER BY CASE WHEN chat_id=? THEN 0 ELSE 1 END, keyword LIMIT 300", (int(chat_id), int(chat_id))).fetchall()
+        return [dict(r) for r in rows]
 
-def add_filter(keyword, response):
+def add_filter(keyword, response, chat_id=0):
     with connect() as c:
-        c.execute("INSERT INTO filters(keyword,response) VALUES(?,?) ON CONFLICT(keyword) DO UPDATE SET response=excluded.response",
-                  (keyword.strip().lower()[:100], response.strip()[:500]))
+        c.execute("INSERT INTO filters_scoped(chat_id,keyword,response) VALUES(?,?,?) ON CONFLICT(chat_id,keyword) DO UPDATE SET response=excluded.response",
+                  (int(chat_id or 0), keyword.strip().lower()[:100], response.strip()[:500]))
 
-def remove_filter(keyword):
+def remove_filter(keyword, chat_id=0):
     with connect() as c:
-        c.execute("DELETE FROM filters WHERE keyword=? COLLATE NOCASE", (keyword,))
+        c.execute("DELETE FROM filters_scoped WHERE chat_id=? AND keyword=? COLLATE NOCASE", (int(chat_id or 0), keyword))
 
-def add_media_filter(media_type, file_unique_id, response):
+def add_media_filter(media_type, file_unique_id, response, chat_id=0):
     key = f"{media_type}:{file_unique_id}"
     with connect() as c:
-        c.execute("INSERT INTO media_filters(media_key,media_type,file_unique_id,response,created_at) VALUES(?,?,?,?,?) "
-                  "ON CONFLICT(media_key) DO UPDATE SET response=excluded.response",
-                  (key, media_type, file_unique_id, response.strip()[:500], datetime.now(timezone.utc).isoformat(timespec="seconds")))
+        c.execute("INSERT INTO media_filters_scoped(chat_id,media_key,media_type,file_unique_id,response,created_at) VALUES(?,?,?,?,?,?) "
+                  "ON CONFLICT(chat_id,media_key) DO UPDATE SET response=excluded.response",
+                  (int(chat_id or 0), key, media_type, file_unique_id, response.strip()[:500], datetime.now(timezone.utc).isoformat()))
     return key
 
-def get_media_filters():
+def get_media_filters(chat_id=None):
     with connect() as c:
-        return [dict(r) for r in c.execute("SELECT media_key,media_type,file_unique_id,response,created_at FROM media_filters ORDER BY created_at DESC LIMIT 200").fetchall()]
+        if chat_id is None:
+            rows = c.execute("SELECT chat_id,media_key,media_type,file_unique_id,response,created_at FROM media_filters_scoped ORDER BY created_at DESC LIMIT 500").fetchall()
+        else:
+            rows = c.execute("SELECT chat_id,media_key,media_type,file_unique_id,response,created_at FROM media_filters_scoped WHERE chat_id IN (0,?) ORDER BY created_at DESC LIMIT 300", (int(chat_id),)).fetchall()
+        return [dict(r) for r in rows]
 
-def get_media_filter(media_type, file_unique_id):
-    # Exact media-file match takes priority; fall back to a media-type-wide filter.
+def get_media_filter(media_type, file_unique_id, chat_id=None):
+    # Group-specific exact match, then group-wide type match, then legacy/global matches.
     exact_key = f"{media_type}:{file_unique_id}"
     generic_key = f"{media_type}:*"
+    chat_ids = [int(chat_id), 0] if chat_id is not None and int(chat_id) != 0 else [0]
     with connect() as c:
-        row = c.execute("SELECT * FROM media_filters WHERE media_key=?", (exact_key,)).fetchone()
-        if row is None:
-            row = c.execute("SELECT * FROM media_filters WHERE media_key=?", (generic_key,)).fetchone()
-        return dict(row) if row else None
+        for scope in chat_ids:
+            row = c.execute("SELECT * FROM media_filters_scoped WHERE chat_id=? AND media_key=?", (scope, exact_key)).fetchone()
+            if row is None:
+                row = c.execute("SELECT * FROM media_filters_scoped WHERE chat_id=? AND media_key=?", (scope, generic_key)).fetchone()
+            if row:
+                return dict(row)
+        return None
 
-def remove_media_filter(media_key):
+def remove_media_filter(media_key, chat_id=0):
     with connect() as c:
-        c.execute("DELETE FROM media_filters WHERE media_key=?", (media_key,))
+        c.execute("DELETE FROM media_filters_scoped WHERE chat_id=? AND media_key=?", (int(chat_id or 0), media_key))
 
 def list_users(limit=50):
     with connect() as c:
@@ -227,6 +256,25 @@ def leaderboard(chat_id, column="total_points", limit=10):
     with connect() as c:
         return [dict(r) for r in c.execute(f"SELECT * FROM group_scores WHERE chat_id=? ORDER BY {column} DESC, updated_at ASC LIMIT ?", (int(chat_id), int(limit))).fetchall()]
 
+def worldwide_leaderboard(column="aura_points", limit=10):
+    """Aggregate scores across every group, one row per Telegram user."""
+    if column not in ("total_points", "aura_points"):
+        column = "aura_points"
+    with connect() as c:
+        sql = f"SELECT user_id, MAX(username) AS username, MAX(first_name) AS first_name, SUM({column}) AS score FROM group_scores GROUP BY user_id ORDER BY score DESC, user_id ASC LIMIT ?"
+        return [dict(r) for r in c.execute(sql, (int(limit),)).fetchall()]
+
+def can_award_message_aura(chat_id, user_id, cooldown_seconds=60):
+    """Limit sentiment Aura to one qualifying message per user per group per cooldown."""
+    import time
+    now = time.time()
+    with connect() as c:
+        row = c.execute("SELECT last_award FROM aura_message_cooldowns WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id))).fetchone()
+        if row and now - float(row["last_award"]) < int(cooldown_seconds):
+            return False
+        c.execute("INSERT INTO aura_message_cooldowns(chat_id,user_id,last_award) VALUES(?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET last_award=excluded.last_award", (int(chat_id), int(user_id), now))
+        return True
+
 def buy_aura_protection(chat_id, user_id, username, first_name, days, cost):
     ensure_score(chat_id, user_id, username, first_name)
     import time
@@ -253,3 +301,15 @@ def set_free_member(chat_id, user_id, enabled=True):
 
 def is_free_member(chat_id, user_id):
     return get_settings().get(f"free:{int(chat_id)}:{int(user_id)}", "0") == "1"
+
+
+def get_owner_dashboard_stats():
+    """Return counts that the bot has actually observed and recorded."""
+    with connect() as c:
+        users = c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+        dm_started = c.execute("SELECT COUNT(*) n FROM users WHERE dm_started=1").fetchone()["n"]
+        groups = c.execute("SELECT COUNT(*) n FROM known_groups").fetchone()["n"]
+        group_members = c.execute("SELECT COUNT(DISTINCT user_id) n FROM group_users").fetchone()["n"]
+        group_memberships = c.execute("SELECT COUNT(*) n FROM group_users").fetchone()["n"]
+        return {"recorded_users": users, "dm_started": dm_started, "groups": groups,
+                "unique_group_members": group_members, "group_memberships": group_memberships}

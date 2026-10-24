@@ -194,7 +194,7 @@ async def command_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("➕ ADD TO GROUP", url=add_group_url)],
         [InlineKeyboardButton("📚 HELP & COMMANDS", callback_data="start:help"), InlineKeyboardButton("🏓 PING", callback_data="start:ping")],
         [InlineKeyboardButton("🎮 GAMES", callback_data="start:games")],
-        [InlineKeyboardButton("👑 OWNER: @Look_at_me_60", url="https://t.me/Look_at_me_60")],
+        [InlineKeyboardButton("👑 OWNER: @Look_at_me60", url="https://t.me/Look_at_me60")],
     ])
     msg = update.effective_message
     if msg:
@@ -205,7 +205,7 @@ async def command_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🛡️ Group Management • 🔎 Filters & Tools\n"
             "📢 Broadcasting • 💞 Social Features\n\n"
             "👑 <b>Developer:</b> Aditya Mani\n"
-            "🔗 <b>Owner:</b> <a href=\"https://t.me/Look_at_me_60\">@Look_at_me_60</a>\n"
+            "🔗 <b>Owner:</b> <a href=\"https://t.me/Look_at_me60\">@Look_at_me60</a>\n"
             "⚡ <i>One Bot. Infinite Possibilities.</i>" + private_note
         )
         banner = os.path.join(os.path.dirname(__file__), "nexus_banner.png")
@@ -232,7 +232,9 @@ Use the buttons below to browse commands. Group moderation commands need admin p
 /auratop — Aura leaderboard
 /giveaura — give Aura to a member
 /protect 1d or /protect 2d — protect Aura using coins"""),
-    "tools": ("❖ TOOLS", """/ping — check bot response time
+    "tools": ("❖ TOOLS", """/imagine <prompt> — generate an AI image in this chat
+/image <prompt> — alias for /imagine
+/ping — check bot response time
 /id — show your ID and chat ID
 /info [@username|ID] or reply — user info
 /history [@username|ID] or reply — saved user history
@@ -292,7 +294,7 @@ def help_keyboard():
 
 async def show_help_menu(message):
     banner = os.path.join(os.path.dirname(__file__), "help_banner.jpg")
-    caption = "<b>🌌 NEXUS — HELP CENTER</b>\n\nChoose a category below to explore commands.\n👑 Owner: <a href=\"https://t.me/Look_at_me_60\">@Look_at_me_60</a>"
+    caption = "<b>🌌 NEXUS — HELP CENTER</b>\n\nChoose a category below to explore commands.\n👑 Owner: <a href=\"https://t.me/Look_at_me60\">@Look_at_me60</a>"
     keyboard = help_keyboard()
     try:
         with open(banner, "rb") as photo:
@@ -383,7 +385,7 @@ async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📛 <b>Username:</b> {username}\n"
         f"🆔 <b>User ID:</b> <code>{user_id if user_id else 'Unknown'}</code>\n"
         f"💬 <b>Chat ID:</b> <code>{chat.id if chat else 'Unknown'}</code>\n\n"
-        f"👑 <b>Owner:</b> @Look_at_me_60"
+        f"👑 <b>Owner:</b> @Look_at_me60"
     )
     await safe_reply(update, text, parse_mode="HTML", disable_web_page_preview=True)
 
@@ -932,7 +934,7 @@ async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📛 <b>Username:</b> {username_text}\n"
         f"🆔 <b>User ID:</b> <code>{user_id}</code>\n"
         "📊 <b>Status:</b> Profile details\n\n"
-        "👑 <b>Owner:</b> @Look_at_me_60\n"
+        "👑 <b>Owner:</b> @Look_at_me60\n"
         "💎 <i>Powered by NEXUS</i>"
     )
     await safe_reply(update, text, reply_markup=keyboard, parse_mode="HTML", disable_web_page_preview=True)
@@ -1152,6 +1154,103 @@ async def aura_for_message(update: Update):
     else:
         # Ensure user appears on this group's points tables.
         adjust_score(chat.id, user.id, user.username, user.first_name)
+
+
+
+async def imagine_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate an image from a text prompt and send it back to the same Telegram chat."""
+    msg = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not msg or not chat or not user:
+        return
+
+    prompt = " ".join(context.args).strip()
+    if not prompt and msg.reply_to_message and msg.reply_to_message.text:
+        prompt = msg.reply_to_message.text.strip()
+    if not prompt:
+        await msg.reply_text(
+            "🎨 <b>Nexus AI Image Generator</b>\n\n"
+            "Use: <code>/imagine a futuristic city at night</code>\n"
+            "Hindi prompt bhi use kar sakte ho: <code>/image blue fire wala anime boy</code>",
+            parse_mode="HTML",
+        )
+        return
+    if len(prompt) > 1000:
+        await msg.reply_text("Prompt 1000 characters se chhota rakho.")
+        return
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        await msg.reply_text(
+            "⚠️ AI image generation abhi configure nahi hai. Owner ko hosting Secrets/.env mein OPENAI_API_KEY set karke bot restart karna hoga."
+        )
+        return
+
+    cooldown = max(0, int(os.getenv("IMAGE_COOLDOWN_SECONDS", "30") or 30))
+    daily_limit = max(1, int(os.getenv("IMAGE_DAILY_LIMIT", "10") or 10))
+    now = time.time()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    cooldowns = context.application.bot_data.setdefault("image_cooldowns", {})
+    daily_counts = context.application.bot_data.setdefault("image_daily_counts", {})
+    user_key = (chat.id, user.id)
+    last_used = cooldowns.get(user_key, 0)
+    if now - last_used < cooldown:
+        wait = max(1, int(cooldown - (now - last_used)))
+        await msg.reply_text(f"⏳ Image generator cooldown: {wait}s baad try karo.")
+        return
+    count_key = (today, user.id)
+    if daily_counts.get(count_key, 0) >= daily_limit:
+        await msg.reply_text(f"🧮 Aaj ka image limit ({daily_limit}) complete ho gaya. Kal phir try karna.")
+        return
+
+    # Reserve usage before making the paid API call to discourage repeated requests.
+    cooldowns[user_key] = now
+    daily_counts[count_key] = daily_counts.get(count_key, 0) + 1
+    status = await msg.reply_text("🎨 <b>Nexus AI</b> tumhari image bana raha hai…", parse_mode="HTML")
+    try:
+        def generate_image():
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key, timeout=180.0, max_retries=1)
+            model = os.getenv("IMAGE_MODEL", "gpt-image-2.5-flare").strip() or "gpt-image-2.5-flare"
+            return client.images.generate(
+                model=model,
+                prompt=prompt,
+                size="1024x1024",
+                quality=os.getenv("IMAGE_QUALITY", "medium").strip() or "medium",
+                output_format="jpeg",
+                n=1,
+            )
+
+        result = await asyncio.to_thread(generate_image)
+        image_b64 = result.data[0].b64_json
+        if not image_b64:
+            raise RuntimeError("Image API returned no image data")
+        import base64
+        from io import BytesIO
+        image_bytes = BytesIO(base64.b64decode(image_b64))
+        image_bytes.name = "nexus_ai_image.jpg"
+        caption = f"🎨 <b>Nexus AI Image</b>\n📝 {html.escape(prompt[:700])}\n👤 Requested by {html.escape(user.full_name[:100])}"
+        await msg.reply_photo(photo=image_bytes, caption=caption, parse_mode="HTML")
+        try:
+            await status.delete()
+        except Exception:
+            pass
+    except Exception as exc:
+        # Refund daily usage on failure; do not expose API keys or raw provider error text.
+        daily_counts[count_key] = max(0, daily_counts.get(count_key, 1) - 1)
+        cooldowns.pop(user_key, None)
+        print(f"Nexus image generation failed: {type(exc).__name__}")
+        message = "❌ Image generate nahi hui. API key, billing, model access aur hosting logs check karo."
+        if type(exc).__name__ in ("AuthenticationError", "PermissionDeniedError"):
+            message = "❌ OpenAI API key invalid hai ya is model ka access nahi hai. API key/model permissions check karo."
+        elif type(exc).__name__ in ("RateLimitError", "APITimeoutError", "APIConnectionError"):
+            message = "❌ Image API busy ya temporarily unavailable hai. Thodi der baad dobara try karo."
+        try:
+            await status.edit_text(message)
+        except Exception:
+            await msg.reply_text(message)
+
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await tracked(update)
@@ -1471,9 +1570,17 @@ async def couple_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         first, second = random.sample(candidates, 2)
     set_setting(key, str(now))
-    caption = (f"💘 Today's Nexus Bot Couple 💘\n\n"
-               f"🌹 {first['first_name']}  ❤️  {second['first_name']} 🌹\n\n"
-               f"Compatibility: {random.randint(60, 100)}% ✨")
+    def display_user(row):
+        uid = int(row["user_id"])
+        username = row.get("username")
+        name = row.get("first_name") or (f"@{username}" if username else str(uid))
+        handle = f"@{username}" if username else "No username"
+        return f"{name} ({handle})\\n🆔 ID: {uid}"
+    caption = ("💘 <b>NEXUS NEW COUPLE</b> 💘\\n\\n"
+               f"🖤 <b>Member 1:</b> {html.escape(display_user(first))}\\n"
+               f"💗 <b>Member 2:</b> {html.escape(display_user(second))}\\n\\n"
+               f"✨ Compatibility: {random.randint(60, 100)}%")
+
     image_id = get_settings().get("couple_image_file_id", "").strip()
     try:
         if image_id:
@@ -1492,9 +1599,12 @@ async def automatic_couple_for_group(bot, chat_id):
     first, second = random.sample(candidates, 2)
     name1 = first.get("first_name") or ("@" + first["username"] if first.get("username") else str(first["user_id"]))
     name2 = second.get("first_name") or ("@" + second["username"] if second.get("username") else str(second["user_id"]))
-    caption = ("💞 𝗡𝗘𝗫𝗨𝗦 𝗖𝗢𝗨𝗣𝗟𝗘 𝗧𝗜𝗠𝗘 💞\n\n"
-               f"🌹 {name1}  ❤️  {name2} 🌹\n\n"
-               f"✨ Compatibility: {random.randint(60, 100)}%\n🌌 New couple every 6 hours")
+    uname1 = f"@{first['username']}" if first.get("username") else "No username"
+    uname2 = f"@{second['username']}" if second.get("username") else "No username"
+    caption = ("💞 𝗡𝗘𝗫𝗨𝗦 𝗖𝗢𝗨𝗣𝗟𝗘 𝗧𝗜𝗠𝗘 💞\\n\\n"
+               f"🖤 {html.escape(name1)} ({html.escape(uname1)}) — ID: {int(first['user_id'])}\\n"
+               f"💗 {html.escape(name2)} ({html.escape(uname2)}) — ID: {int(second['user_id'])}\\n\\n"
+               f"✨ Compatibility: {random.randint(60, 100)}%\\n🌌 New couple every 6 hours")
     settings = get_settings()
     image_id = settings.get("couple_image_file_id", "").strip()
     if image_id:
@@ -1534,6 +1644,8 @@ def build_bot():
     bot_app.add_handler(CommandHandler("start", command_start))
     bot_app.add_handler(CommandHandler("help", help_cmd))
     bot_app.add_handler(CommandHandler("ping", ping_cmd))
+    bot_app.add_handler(CommandHandler("imagine", imagine_cmd))
+    bot_app.add_handler(CommandHandler("image", imagine_cmd))
     bot_app.add_handler(CommandHandler("adminlist", adminlist_cmd))
     bot_app.add_handler(CommandHandler("report", report_cmd))
     bot_app.add_handler(CommandHandler("points", points_cmd))
@@ -1565,6 +1677,7 @@ def build_bot():
     bot_app.add_handler(CommandHandler("filter", filter_cmd))
     bot_app.add_handler(CommandHandler("filters", filters_cmd))
     bot_app.add_handler(CommandHandler("couple", couple_cmd))
+    bot_app.add_handler(CommandHandler("newcouple", couple_cmd))
     bot_app.add_handler(CommandHandler("setcoupleimage", set_couple_image_cmd))
     bot_app.add_handler(CommandHandler("hidden", hidden_cmd))
     bot_app.add_handler(CommandHandler("scramble", scramble_cmd))
